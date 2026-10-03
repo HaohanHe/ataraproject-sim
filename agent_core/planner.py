@@ -50,6 +50,7 @@ EDGE_MARGIN_DEG = 0.08
 DURATIONS = (300, 450, 600, 900, 1200, 1500, 1800, 2400, 3000, 3600)
 MIN_VISIBLE_SECONDS = 600
 NEIGHBOUR_RADIUS_DEG = 2.1
+WIDE_RADIUS_DEG = 3.6
 ANCHORS = 6
 ANCHOR_POOL = 300
 CLOSED_KINDS = {"rain", "storm"}
@@ -585,6 +586,40 @@ class Planner:
                 best_score, program = score, name
         if state.force_program:
             program = state.force_program
+
+        # Throughput pass: the anchor near pool leaves several fibres empty on the
+        # average exposure. Pack them now with any visible target that geometrically
+        # lands in the empty fibre and stays up for the whole exposure. Extra targets
+        # can only add science (score >= 0); duration and program are already fixed.
+        taken = set(assignments.values())
+        if len(assignments) < self.grid.n:
+            empty = [f for f in range(self.grid.n) if str(f) not in assignments]
+            fill: dict[int, tuple] = {}
+            placed: set[str] = set()
+            for j in state.neighbours(c_ra, c_dec, WIDE_RADIUS_DEG):
+                tid = state.ids[j]
+                if tid in taken or tid in placed:
+                    continue
+                alt_j, az_j = radec_to_altaz(state.ra[j], state.dec[j], lst, state.lat)
+                if alt_j < state.min_alt:
+                    continue
+                ha_j = wrap180(lst - state.ra[j])
+                up_j = (state.hmax[j] - ha_j) / SIDEREAL_DEG_PER_SECOND if state.hmax[j] < 180 else 1e9
+                if up_j < duration:
+                    continue
+                off = tangent_offsets(alt_j, az_j, c_alt, c_az)
+                if off is None:
+                    continue
+                fib, _margin = self.grid.classify(*off)
+                if fib not in empty:
+                    continue
+                rank = (0 if state.factor[j] < 0.02 else 1,
+                        -state.weight[j] * max(0.2, 1.0 - state.factor[j]))
+                if fib not in fill or rank < fill[fib][0]:
+                    fill[fib] = (rank, tid)
+                    placed.add(tid)
+            for fib, (_rank, tid) in fill.items():
+                assignments[str(fib)] = tid
 
         clean = not state.all_sky_notice()
         state.pending.clear()
