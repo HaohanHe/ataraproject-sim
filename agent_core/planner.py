@@ -272,16 +272,28 @@ class Planner:
         if fast_track:
             if self.suspicion_hours and hours - self.suspicion_hours[-1][0] < 3.0:
                 return None
-            self.suspicion_hours.append((hours, night_index))
+            self.suspicion_hours.append((hours, night_index, evidence.recent_median))
             if len(self.suspicion_hours) < 2:
                 return None
         else:
-            nights_confirmed = {n for _, n in self.suspicion_hours}
+            nights_confirmed = {n for _, n, _m in self.suspicion_hours}
             if night_index not in nights_confirmed:
-                self.suspicion_hours.append((hours, night_index))
+                self.suspicion_hours.append((hours, night_index, evidence.recent_median))
                 nights_confirmed.add(night_index)
             if len(nights_confirmed) < 3:
                 return None
+        # Earthquake gate: a quake depresses efficiency but recovers night by night,
+        # while a real instrument fault stays flat. When confirmations span nights and
+        # the latest median has recovered materially over the first, this is a quake.
+        nights_span = len({n for _, n, _m in self.suspicion_hours})
+        first_med = self.suspicion_hours[0][2]
+        latest_med = self.suspicion_hours[-1][2]
+        if nights_span >= 2 and first_med > 0 and latest_med >= 1.12 * first_med:
+            self.log(f"planner: dip at {payload.get('now_utc')} shows earthquake-style recovery "
+                     f"({first_med:.3f} -> {latest_med:.3f}); not a fault, track reset")
+            self.suspicion_hours = []
+            self.last_report_hours = hours
+            return None
         self.suspicion_hours = []
         verdict = self._ask_verdict(evidence, payload)
         # Both completed tracks are hard evidence: the fast track needs a strong dip
