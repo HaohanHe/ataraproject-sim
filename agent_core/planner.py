@@ -81,6 +81,11 @@ class Planner:
         self.state = state
         self.log = log
         self.grid = state.fiber_grid
+        # Central fibres for a grid of any size (the count is card-specific and given
+        # in initialize; never assume 16 / 4x4).
+        _s = self.grid.side
+        _rc = ((_s - 1) // 2, _s // 2)
+        self.central_fibers = tuple(r * _s + c for r in _rc for c in _rc)
         self.llm = LLMClient(log=log)
         self.trace = TraceLog(log=log)
 
@@ -454,7 +459,7 @@ class Planner:
         anchors.sort(key=lambda t: -t[0])
 
         n_anchors = 1 if state.fast_level >= 1 else ANCHORS
-        fibers = range(self.grid.n) if state.fast_level < 2 else (5, 6, 9, 10)
+        fibers = range(self.grid.n) if state.fast_level < 2 else self.central_fibers
         best = None  # (total, c_alt, c_az, chosen)
         tried = 0
         for _, anchor in anchors:
