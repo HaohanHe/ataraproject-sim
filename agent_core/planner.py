@@ -556,9 +556,17 @@ class Planner:
         forced = [item for item in info.values()
                   if req_info.get(item["i"]) and item["k"] > 0]
         if forced:
-            t_needs = [req_info[item["i"]]["threshold"] / item["k"] for item in forced]
-            tf = int(math.ceil(max(t_needs) / 30.0) * 30)
-            tf = max(state.min_exposure, min(state.max_exposure, tf))
+            # cross only enough targets to reach the minimum (6): use the duration
+            # needed by the slowest AMONG THE FIRST `need` targets, never the
+            # single hardest target (which may need the full 3600 s)
+            need0 = 6 - sum(1 for item in forced
+                            if state.factor[item["i"]] >= req_info[item["i"]]["threshold"])
+            need0 = max(1, min(need0, len(forced)))
+            t_needs = sorted(req_info[item["i"]]["threshold"] / item["k"]
+                             for item in forced if item["k"] > 0)
+            if t_needs:
+                tf = int(math.ceil(t_needs[min(need0, len(t_needs)) - 1] / 30.0) * 30)
+                tf = max(state.min_exposure, min(state.max_exposure, tf))
             if tf <= seconds_left and tf <= center_up:
                 gf = 0.0
                 for item in info.values():
