@@ -51,6 +51,10 @@ DURATIONS = (300, 450, 600, 900, 1200, 1500, 1800, 2400, 3000, 3600)
 MIN_VISIBLE_SECONDS = 600
 NEIGHBOUR_RADIUS_DEG = 2.1
 WIDE_RADIUS_DEG = 3.6
+# Packing radii scale with the card's actual FOV: fiber counts vary per card
+# (9 to 81), so a fixed radius leaves large grids severely under-packed. The near
+# pool must reach the far FOV edge when the anchor sits in a corner fibre; the
+# throughput-fill pass must cover the half-diagonal with margin.
 ANCHORS = 6
 ANCHOR_POOL = 300
 CLOSED_KINDS = {"rain", "storm"}
@@ -469,7 +473,9 @@ class Planner:
                 break
             tried += 1
             a_alt, a_az = altaz(anchor)
-            near = [j for j in state.neighbours(state.ra[anchor], state.dec[anchor], NEIGHBOUR_RADIUS_DEG) if j in visible]
+            near = [j for j in state.neighbours(
+                state.ra[anchor], state.dec[anchor], max(NEIGHBOUR_RADIUS_DEG, self.grid.fov * 0.83)
+            ) if j in visible]
             near_values = {j: achievable(j) for j in near}
             for fiber in fibers:
                 d_north, d_east = self.grid.fiber_center(fiber)
@@ -613,7 +619,8 @@ class Planner:
             empty = [f for f in range(self.grid.n) if str(f) not in assignments]
             fill: dict[int, tuple] = {}
             placed: set[str] = set()
-            for j in state.neighbours(c_ra, c_dec, WIDE_RADIUS_DEG):
+            fill_radius = max(WIDE_RADIUS_DEG, self.grid.fov * 0.78)
+            for j in state.neighbours(c_ra, c_dec, fill_radius):
                 tid = state.ids[j]
                 if tid in taken or tid in placed:
                     continue
