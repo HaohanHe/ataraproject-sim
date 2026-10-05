@@ -539,7 +539,7 @@ class Planner:
                     continue
                 reached = min(1.0, item["k"] * duration)
                 f = state.factor[item["i"]]
-                gain += state.weight[item["i"]] * max(0.0, reached * reached - f * f)
+                gain += state.weight[item["i"]] * max(0.0, reached - f)
                 if state.required[item["i"]] and f < 0.5 and reached >= 0.5:
                     gain += REQUIRED_BONUS
                 ri = req_info.get(item["i"])
@@ -553,8 +553,7 @@ class Planner:
         # do not count). When the deadline is within ~24 h, force the duration
         # needed to cross the hardest request target in this field.
         forced = [item for item in info.values()
-                  if req_info.get(item["i"]) and item["k"] > 0
-                  and req_info[item["i"]]["hours_left"] < 24]
+                  if req_info.get(item["i"]) and item["k"] > 0]
         if forced:
             t_needs = [req_info[item["i"]]["threshold"] / item["k"] for item in forced]
             tf = int(math.ceil(max(t_needs) / 30.0) * 30)
@@ -566,7 +565,7 @@ class Planner:
                         continue
                     reached = min(1.0, item["k"] * tf)
                     f = state.factor[item["i"]]
-                    gf += state.weight[item["i"]] * max(0.0, reached * reached - f * f)
+                    gf += state.weight[item["i"]] * max(0.0, reached - f)
                     if state.required[item["i"]] and f < 0.5 and reached >= 0.5:
                         gf += REQUIRED_BONUS
                     ri = req_info.get(item["i"])
