@@ -404,9 +404,10 @@ class Planner:
                 setting = (1.0 + 0.5 * max(0.0, ha / h)) if h < 180 else 1.0
                 priority = v * (1.0 + 2.0 / nights_left) * setting
                 if ri is not None:
-                    # deadline urgency ramps up over the final ~36 hours so the
-                    # last available night is spent finishing request targets
-                    urgency = 1.0 + max(0.0, 36.0 - ri["hours_left"]) * 0.5
+                    # Requests have a ~one-night window (issued ~31 h before deadline).
+                    # On that night fully dedicate scheduling to request targets;
+                    # otherwise a flat priority share.
+                    urgency = 20.0 if ri["hours_left"] < 36 else 1.0
                     priority += ri["share"] * urgency
                 candidates.append((priority, i))
         state.active = still_active
@@ -571,8 +572,10 @@ class Planner:
                     ri = req_info.get(item["i"])
                     if ri and reached >= ri["threshold"]:
                         gf += ri["share"]
-                if gf > 0.0 and (best is None or gf / tf > best[0]):
-                    best = (gf / tf, tf)
+                hl_min = min(req_info[item["i"]]["hours_left"] for item in forced)
+                gfr = gf / tf
+                if gf > 0.0 and (hl_min < 36 or best is None or gfr > best[0]):
+                    best = (gfr, tf)
         if best is None:
             return None
         duration = best[1]
