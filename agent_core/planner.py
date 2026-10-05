@@ -23,6 +23,7 @@ example target-for-target, so both examples solve the problem the same way.
 from __future__ import annotations
 
 import math
+import os
 from datetime import timedelta
 
 from .geometry import (
@@ -46,6 +47,15 @@ from .state import PendingPrediction
 REQUIRED_BONUS = 60.0
 DONE_FACTOR = 0.95
 PLAN_FACTOR_SAFETY = 0.9
+# H1 gated Target-of-Opportunity scheduler
+FEAT_TOO = os.environ.get("FEAT_TOO", "1") != "0"
+TOO_HOURS = 20.0
+TOO_MARGIN = 1.2
+TOO_K = 8
+TOO_TAU_MAX = 1200
+TOO_MAX_ATTEMPTS = 2
+TOO_PACK_MIN = 0.75     # forced pointing must pack at least this fraction of fibres
+TOO_KEEP_RATIO = 0.90   # ...and keep this share of the normal plan's fibre count
 EDGE_MARGIN_DEG = 0.08
 DURATIONS = (300, 450, 600, 900, 1200, 1500, 1800, 2400, 3000, 3600)
 MIN_VISIBLE_SECONDS = 600
@@ -102,6 +112,12 @@ class Planner:
         self._last_forecast_notices: list = []
         self.total_assigned = 0
         self.total_hit = 0
+        # H1 bookkeeping
+        self.too_attempts: dict[int, int] = {}   # i -> dedicated exposure count
+        self.too_qobs: dict[int, float] = {}     # i -> measured per-450s quality
+        self.too_crossed: dict[str, set] = {}    # rid -> locally crossed i, unconfirmed
+        self.last_forced: list[int] = []
+        self.prev_factor: dict[int, float] = {}
 
         log(f"planner: {len(state.ids)} targets ({sum(state.required)} required), "
             f"{len(state.nights)} nights, llm model={self.llm.model} base_url={self.llm.base_url}")
@@ -117,8 +133,12 @@ class Planner:
             if message.get("record_type") == "forecast":
                 self._last_forecast_notices = message.get("notices", [])
         state.on_messages(payload.get("new_messages", []), payload.get("latest_bulletin"))
+        last_forced = self.last_forced
+        prev_factor = {i: state.factor[i] for i in last_forced}
+        self.last_forced = []
         state.on_result(payload.get("last_result"), hours)
         state.update_requests(payload.get("active_requests"))
+        self._learn_too(payload.get("last_result"), last_forced, prev_factor, now)
         last_result = payload.get("last_result")
         if last_result and last_result.get("action") == "observe":
             self.total_assigned += int(last_result.get("assigned_count", 0))
@@ -151,8 +171,8 @@ class Planner:
         if report is not None:
             return report
 
-        action = self.plan(now, night_end, night_index, hours,
-                           float((payload.get("wallclock") or {}).get("remaining_seconds", 1e9)))
+        wall = float((payload.get("wallclock") or {}).get("remaining_seconds", 1e9))
+        action = self._observe_with_too(now, night_end, night_index, hours, wall, night_start)
         if action is None:
             return {"action": "wait", "duration_seconds": self._to_next_slot(now, night_start),
                     "reason": "nothing useful is up"}
@@ -373,9 +393,140 @@ class Planner:
             return (state.weight[i] * (1.0 - f * f) + REQUIRED_BONUS * (1.0 if f < 0.5 else 0.35)) * damp
         return 0.0 if f >= DONE_FACTOR else state.weight[i] * (1.0 - f * f) * damp
 
+    # -- H1 gated Target-of-Opportunity ------------------------------------------
+
+    def _learn_too(self, last_result, forced, prev_factor, now) -> None:
+        """Update local-crossed sets and, for a first-time dedicated target, the
+        measured per-450s quality used for the next tau estimate."""
+        state = self.state
+        if last_result and last_result.get("action") == "observe":
+            rows = last_result.get("scores") or []
+            scores: dict[str, float] = {}
+            if rows and isinstance(rows[0], dict):
+                for row in rows:
+                    scores[str(row.get("target_id"))] = float(row.get("best_score", 0.0))
+            else:
+                for tid, val in zip(last_result.get("observed_ids") or [],
+                                    last_result.get("best_scores") or []):
+                    scores[str(tid)] = float(val)
+            duration = float(last_result.get("duration_seconds") or 0)
+            for i in forced:
+                g = scores.get(state.ids[i])
+                if g is None:
+                    continue
+                for rid, rec in state.requests.items():
+                    if (rec["issued"] <= now < rec["deadline"] and state.ids[i] in rec["targets"]
+                            and state.ids[i] not in rec["completed"] and g >= rec["threshold"]):
+                        self.too_crossed.setdefault(rid, set()).add(i)
+                if duration > 0 and prev_factor.get(i, 0.0) < 0.02 and g > 0:
+                    self.too_qobs[i] = max(1e-3, g * 450.0 / duration)
+
+    def _target_rate(self, i: int, at):
+        state = self.state
+        lst = local_sidereal_deg(at, state.lon)
+        alt, az = radec_to_altaz(state.ra[i], state.dec[i], lst, state.lat)
+        moon = Moon(at, lst, state.lat)
+        lunar = lunar_factor(moon, state.ra[i], state.dec[i], state.scoring.lunar_model)
+        model = state.scoring.quality_model(alt, lunar) or 0.0
+        k = (state.flux[i] * model * state.scale * PLAN_FACTOR_SAFETY) / state.scoring.f0t0
+        return alt, model, k
+
+    def _pack_count(self, i: int, tau: int) -> int:
+        """Cheap proxy for how many fibres a forced pointing at target i would fill:
+        catalog targets currently inside the near-pool radius and up long enough."""
+        state = self.state
+        n = 0
+        for j in state.neighbours(state.ra[i], state.dec[i], state.near_radius):
+            if j == i:
+                n += 1
+                continue
+            ha = wrap180(local_sidereal_deg(state._last_now, state.lon) - state.ra[j])
+            if -state.hmax[j] <= ha <= state.hmax[j]:
+                up = (state.hmax[j] - ha) / SIDEREAL_DEG_PER_SECOND if state.hmax[j] < 180 else 1e9
+                if up >= min(tau, 600):
+                    n += 1
+        return n
+
+    def _observe_with_too(self, now, night_end, night_index, hours, wall, night_start):
+        state = self.state
+        normal = self.plan(now, night_end, night_index, hours, wall)
+        if normal is None or not FEAT_TOO:
+            return normal
+        choice = None  # (latest_start, i, tau, rid)
+        n_fibers = self.grid.n
+        for rid, rec in state.requests.items():
+            hours_left = (rec["deadline"] - now).total_seconds() / 3600.0
+            if hours_left <= 0.0 or hours_left > TOO_HOURS:
+                continue
+            crossed = len(rec["completed"]) + len(self.too_crossed.get(rid, ()))
+            need = rec["minimum"] - crossed
+            if need <= 0 or need > TOO_K:
+                continue
+            done = set(rec["completed"]) | {state.ids[i] for i in self.too_crossed.get(rid, ())}
+            targets = [state.index_of[t] for t in rec["targets"]
+                       if t not in done and state.index_of.get(t) is not None]
+            feas = []
+            for i in targets:
+                if self.too_attempts.get(i, 0) >= TOO_MAX_ATTEMPTS:
+                    continue
+                qobs = self.too_qobs.get(i)
+                alt, model, k = self._target_rate(i, now + timedelta(seconds=300))
+                if qobs is not None:
+                    rate, margin = qobs / 450.0, 1.1
+                else:
+                    if k <= 0.0 or model < 0.2:
+                        continue
+                    rate, margin = k, TOO_MARGIN
+                tau = int(math.ceil(margin * rec["threshold"] / rate / 30.0) * 30)
+                tau = max(state.min_exposure, min(TOO_TAU_MAX, tau))
+                ha0 = wrap180(local_sidereal_deg(now, state.lon) - state.ra[i])
+                h = state.hmax[i]
+                if h >= 180:
+                    up_now, latest_start = 1e9, 1e9
+                else:
+                    up_now = (h - ha0) / SIDEREAL_DEG_PER_SECOND
+                    if ha0 < -h:
+                        wait_s = (-h - ha0) / SIDEREAL_DEG_PER_SECOND
+                        up_span = (2 * h) / SIDEREAL_DEG_PER_SECOND
+                        if up_span < tau:
+                            continue
+                        latest_start, up_now = wait_s + up_span - tau, -1.0
+                    else:
+                        latest_start = up_now - tau
+                latest_start = min(latest_start,
+                                   (night_end - now).total_seconds() - tau)
+                if latest_start < 0 or up_now < tau:
+                    continue
+                state._last_now = now
+                if self._pack_count(i, tau) < TOO_PACK_MIN * n_fibers:
+                    continue
+                feas.append((latest_start, i, tau))
+            if len(feas) < need:
+                self.log(f"planner: ToO {rid} not arming: {len(feas)}/{need} targets can pack tonight")
+                continue
+            feas.sort(key=lambda f: f[0])
+            ls, i, tau = feas[0]
+            if choice is None or ls < choice[0]:
+                choice = (ls, i, tau, rid)
+        if choice is None:
+            return normal
+        _, i, tau, rid = choice
+        forced = self.plan(now, night_end, night_index, hours, wall,
+                           forced_too=(i, tau, rid))
+        if forced is None or len(forced["assignments"]) < TOO_KEEP_RATIO * len(normal["assignments"]):
+            self.log(f"planner: ToO {rid} would lose too many fibres; keep normal plan")
+            return normal
+        self.too_attempts[i] = self.too_attempts.get(i, 0) + 1
+        self.last_forced = [i]
+        self.log(f"planner: ToO {rid} armed; forced {len(forced['assignments'])} fibres "
+                 f"on {state.ids[i]} for {forced['duration_seconds']}s "
+                 f"(attempt {self.too_attempts[i]})")
+        return forced
+
     # -- main planning pass -------------------------------------------------------
 
-    def plan(self, now, night_end, night_index: int, hours: float, wall_remaining: float = 1e9):
+    def plan(self, now, night_end, night_index: int, hours: float,
+             wall_remaining: float = 1e9, forced_too=None):
         state = self.state
         state.update_scale(hours)
         lst = local_sidereal_deg(now, state.lon)
@@ -462,6 +613,9 @@ class Planner:
             return None
         anchors.sort(key=lambda t: -t[0])
 
+        if forced_too is not None:
+            anchors = [(1e18, forced_too[0])]
+
         n_anchors = 1 if state.fast_level >= 1 else ANCHORS
         fibers = range(self.grid.n) if state.fast_level < 2 else self.central_fibers
         best = None  # (total, c_alt, c_az, chosen)
@@ -507,9 +661,13 @@ class Planner:
         if best is None:
             return None
         _, c_alt, c_az, chosen = best
-        return self._finish_plan(now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index, req_info, wall_remaining)
+        return self._finish_plan(now, lst, c_alt, c_az, chosen, seconds_left, moon,
+                                 altaz, hours, night_index, req_info, wall_remaining,
+                                 forced_too=forced_too)
 
-    def _finish_plan(self, now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index, req_info, wall_remaining: float = 1e9):
+    def _finish_plan(self, now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz,
+                     hours, night_index, req_info, wall_remaining: float = 1e9,
+                     forced_too=None):
         state = self.state
         scoring = state.scoring
         c_ra, c_dec = altaz_to_radec(c_alt, c_az, lst, state.lat)
@@ -573,6 +731,15 @@ class Planner:
                         gf += ri["share"]
                 if gf > 0.0 and (best is None or gf / tf > best[0]):
                     best = (gf / tf, tf)
+        if forced_too is not None:
+            fi, ftau, rid = forced_too
+            item_fi = next((item for item in info.values() if item["i"] == fi), None)
+            if item_fi is not None and ftau <= seconds_left and ftau <= center_up:
+                normal_t = best[1] if best is not None else ftau
+                dur = min(max(ftau, normal_t),
+                          int(item_fi["up"]), seconds_left, int(center_up))
+                if dur >= ftau:
+                    best = (1e9, int(dur))
         if best is None:
             return None
         duration = best[1]
