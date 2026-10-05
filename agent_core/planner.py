@@ -23,6 +23,7 @@ example target-for-target, so both examples solve the problem the same way.
 from __future__ import annotations
 
 import math
+import os
 from datetime import timedelta
 
 from .geometry import (
@@ -46,6 +47,16 @@ from .state import PendingPrediction
 REQUIRED_BONUS = 60.0
 DONE_FACTOR = 0.95
 PLAN_FACTOR_SAFETY = 0.9
+CLIFF_MARGIN = 1.15
+FEAT_CLIFF = os.environ.get("FEAT_CLIFF") == "1"
+FEAT_ENDGAME = os.environ.get("FEAT_ENDGAME") == "1"
+FEAT_UNIF_W = float(os.environ.get("FEAT_UNIF_W", "0"))
+FEAT_WGATE = os.environ.get("FEAT_WGATE") == "1"
+FEAT_TOO = os.environ.get("FEAT_TOO", "1") != "0"
+TOO_HOURS = 20.0
+TOO_MARGIN = 1.2
+TOO_K = 8
+ENDGAME_FLEX = 0.25
 EDGE_MARGIN_DEG = 0.08
 DURATIONS = (300, 450, 600, 900, 1200, 1500, 1800, 2400, 3000, 3600)
 MIN_VISIBLE_SECONDS = 600
@@ -102,6 +113,9 @@ class Planner:
         self._last_forecast_notices: list = []
         self.total_assigned = 0
         self.total_hit = 0
+        # H1: targets locally crossed within each request window but not yet
+        # confirmed in the server's completed_target_ids: rid -> set(i)
+        self.too_local: dict[str, set] = {}
 
         log(f"planner: {len(state.ids)} targets ({sum(state.required)} required), "
             f"{len(state.nights)} nights, llm model={self.llm.model} base_url={self.llm.base_url}")
@@ -117,8 +131,10 @@ class Planner:
             if message.get("record_type") == "forecast":
                 self._last_forecast_notices = message.get("notices", [])
         state.on_messages(payload.get("new_messages", []), payload.get("latest_bulletin"))
+        prev_pending = dict(state.pending)
         state.on_result(payload.get("last_result"), hours)
         state.update_requests(payload.get("active_requests"))
+        self._note_local_crossings(prev_pending, now)
         last_result = payload.get("last_result")
         if last_result and last_result.get("action") == "observe":
             self.total_assigned += int(last_result.get("assigned_count", 0))
@@ -151,8 +167,15 @@ class Planner:
         if report is not None:
             return report
 
+        # H1 gated ToO: dedicate this exposure only when the minimum set is
+        # feasible tonight; other fibres still pack regular science.
+        too = self._too_dedicated(now, night_end, night_index)
+        forced_too = None
+        if too is not None:
+            forced_too = too
         action = self.plan(now, night_end, night_index, hours,
-                           float((payload.get("wallclock") or {}).get("remaining_seconds", 1e9)))
+                           float((payload.get("wallclock") or {}).get("remaining_seconds", 1e9)),
+                           forced_too=forced_too)
         if action is None:
             return {"action": "wait", "duration_seconds": self._to_next_slot(now, night_start),
                     "reason": "nothing useful is up"}
@@ -373,9 +396,101 @@ class Planner:
             return (state.weight[i] * (1.0 - f * f) + REQUIRED_BONUS * (1.0 if f < 0.5 else 0.35)) * damp
         return 0.0 if f >= DONE_FACTOR else state.weight[i] * (1.0 - f * f) * damp
 
+    # -- H1 gated Target-of-Opportunity single-night scheduler -------------------
+
+    def _note_local_crossings(self, prev_pending, now) -> None:
+        """Track request targets crossed by our exposures inside the request window
+        but not yet confirmed in the server's completed_target_ids."""
+        state = self.state
+        for rid, rec in state.requests.items():
+            if not (rec["issued"] <= now < rec["deadline"]):
+                continue
+            crossed = self.too_local.setdefault(rid, set())
+            for tid in prev_pending:
+                if tid in rec["targets"] and tid not in rec["completed"]:
+                    i = state.index_of.get(tid)
+                    if i is not None and state.factor[i] >= rec["threshold"]:
+                        crossed.add(i)
+
+    def _target_quality(self, i: int, at):
+        state = self.state
+        lst = local_sidereal_deg(at, state.lon)
+        alt, az = radec_to_altaz(state.ra[i], state.dec[i], lst, state.lat)
+        moon = Moon(at, lst, state.lat)
+        lunar = lunar_factor(moon, state.ra[i], state.dec[i], state.scoring.lunar_model)
+        model = state.scoring.quality_model(alt, lunar) or 0.0
+        k = (state.flux[i] * model * state.scale * PLAN_FACTOR_SAFETY) / state.scoring.f0t0
+        return alt, az, model, k
+
+    def _too_dedicated(self, now, night_end, night_index):
+        """Return (i, tau, rid) for the current exposure when a gated ToO is armed;
+        None otherwise. A request arms only on its last night and only when the
+        minimum target set is feasible tonight within TOO_K exposures."""
+        if not FEAT_TOO:
+            return None
+        state = self.state
+        choice = None  # (latest_start, i, tau, rid)
+        for rid, rec in state.requests.items():
+            hours_left = (rec["deadline"] - now).total_seconds() / 3600.0
+            if hours_left <= 0.0 or hours_left > TOO_HOURS:
+                continue
+            crossed = len(rec["completed"]) + len(self.too_local.get(rid, ()))
+            need = rec["minimum"] - crossed
+            if need <= 0:
+                continue
+            done = set(rec["completed"]) | {state.ids[i] for i in self.too_local.get(rid, ())}
+            targets = [state.index_of[t] for t in rec["targets"]
+                       if t not in done and state.index_of.get(t) is not None]
+            feas = []  # (latest_start, i, tau, up_now)
+            for i in targets:
+                alt, az, model, k = self._target_quality(i, now + timedelta(seconds=300))
+                if k <= 0.0 or model < 0.2:
+                    continue
+                tau = int(math.ceil(TOO_MARGIN * rec["threshold"] / k / 30.0) * 30)
+                tau = max(state.min_exposure, min(state.max_exposure, tau))
+                ha0 = wrap180(local_sidereal_deg(now, state.lon) - state.ra[i])
+                h = state.hmax[i]
+                if h >= 180:
+                    up_now = 1e9
+                    latest_start = 1e9
+                else:
+                    up_now = (h - ha0) / SIDEREAL_DEG_PER_SECOND
+                    if ha0 < -h:
+                        # not yet risen
+                        wait_s = (-h - ha0) / SIDEREAL_DEG_PER_SECOND
+                        up_span = (2 * h) / SIDEREAL_DEG_PER_SECOND
+                        if up_span < tau:
+                            continue
+                        latest_start = wait_s + up_span - tau
+                        up_now = -1.0
+                    else:
+                        latest_start = up_now - tau
+                sec_to_end = (night_end - now).total_seconds()
+                latest_start = min(latest_start, sec_to_end - tau)
+                if latest_start < 0:
+                    continue
+                feas.append((latest_start, i, tau, up_now))
+            if need > TOO_K or len(feas) < need:
+                self.log(f"planner: ToO {rid} not arming: {len(feas)}/{need} targets feasible tonight")
+                continue
+            # EDF among targets that can be crossed starting now
+            ready = [f for f in feas if f[3] >= f[2]]
+            if not ready:
+                continue
+            ready.sort(key=lambda f: f[0])
+            ls, i, tau, _u = ready[0]
+            if choice is None or ls < choice[0]:
+                choice = (ls, i, tau, rid)
+        if choice is None:
+            return None
+        _, i, tau, rid = choice
+        self.log(f"planner: ToO {rid} armed; dedicate this exposure to {state.ids[i]} for {tau}s")
+        return i, tau, rid
+
     # -- main planning pass -------------------------------------------------------
 
-    def plan(self, now, night_end, night_index: int, hours: float, wall_remaining: float = 1e9):
+    def plan(self, now, night_end, night_index: int, hours: float,
+             wall_remaining: float = 1e9, forced_too=None):
         state = self.state
         state.update_scale(hours)
         lst = local_sidereal_deg(now, state.lon)
@@ -462,6 +577,10 @@ class Planner:
             return None
         anchors.sort(key=lambda t: -t[0])
 
+        if forced_too is not None:
+            fi = forced_too[0]
+            anchors = [(1e18, fi)]
+
         n_anchors = 1 if state.fast_level >= 1 else ANCHORS
         fibers = range(self.grid.n) if state.fast_level < 2 else self.central_fibers
         best = None  # (total, c_alt, c_az, chosen)
@@ -507,9 +626,13 @@ class Planner:
         if best is None:
             return None
         _, c_alt, c_az, chosen = best
-        return self._finish_plan(now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index, req_info, wall_remaining)
+        return self._finish_plan(now, lst, c_alt, c_az, chosen, seconds_left, moon,
+                                 altaz, hours, night_index, req_info, wall_remaining,
+                                 forced_too=forced_too)
 
-    def _finish_plan(self, now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index, req_info, wall_remaining: float = 1e9):
+    def _finish_plan(self, now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz,
+                     hours, night_index, req_info, wall_remaining: float = 1e9,
+                     forced_too=None):
         state = self.state
         scoring = state.scoring
         c_ra, c_dec = altaz_to_radec(c_alt, c_az, lst, state.lat)
@@ -573,6 +696,11 @@ class Planner:
                         gf += ri["share"]
                 if gf > 0.0 and (best is None or gf / tf > best[0]):
                     best = (gf / tf, tf)
+        if forced_too is not None:
+            fi, ftau, rid = forced_too
+            present = any(item["i"] == fi and item["up"] >= ftau for item in info.values())
+            if present and ftau <= seconds_left and ftau <= center_up:
+                best = (1e9, ftau)
         if best is None:
             return None
         duration = best[1]
