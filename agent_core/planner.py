@@ -63,7 +63,7 @@ BLOCKING_KINDS = {"terrain_obstruction", "rocket_launch"}
 DIRECTION_AZ = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0,
                 "SW": 225.0, "W": 270.0, "NW": 315.0}
 
-REPORT_DROP = 0.62
+REPORT_DROP = 0.75
 REPORT_CONFIRMATIONS = 3
 REPORT_SPACING_HOURS = 6.0
 MAX_REPORTS = 2
@@ -404,7 +404,9 @@ class Planner:
         threshold = state.scoring.required_threshold
         if state.required[i]:
             if f >= threshold:
-                return state.weight[i] * max(0.0, 1.0 - f * f) * damp
+                # required target is safe once past the single-exposure cliff;
+                # close it and redirect the fibre to never-covered targets
+                return 0.0
             return (state.weight[i] * (1.0 - f * f) + REQUIRED_BONUS * (1.0 if f < 0.5 else 0.35)) * damp
         return 0.0 if f >= DONE_FACTOR else state.weight[i] * (1.0 - f * f) * damp
 
@@ -490,17 +492,19 @@ class Planner:
         fov_r = self.grid.fov_radius
 
         def pack_count(ai: int) -> int:
+            # Count only NEVER-observed visible targets in the FOV: fields already
+            # swept have no marginal coverage left, while sparse fields full of fresh
+            # targets survive the gate and get reached before the survey ends.
             return sum(1 for j in state.neighbours(state.ra[ai], state.dec[ai], fov_r)
-                       if j in visible)
+                       if j in visible and state.factor[j] < 0.02)
 
         for checked, (priority, i) in enumerate(candidates):
             if checked >= ANCHOR_POOL and len(anchors) >= 3 * ANCHORS:
                 break
             weighted = achievable(i) * priority / max(1e-9, self._value(i))
-            # Density gate: a pointing can only score targets physically inside
-            # the FOV, so prefer anchors whose field packs many fibres. Sparse
-            # anchors are down-weighted (not banned) so isolated targets still
-            # get covered late in the survey.
+            # Unobserved-density gate: prefer fields whose FOV packs many fibres with
+            # fresh targets. Sparse fresh fields are down-weighted (not banned) so
+            # isolated targets still get covered late in the survey.
             pack_frac = min(1.0, pack_count(i) / self.grid.n)
             weighted *= pack_frac ** 0.6
             if weighted > 0:

@@ -396,8 +396,17 @@ class SurveyState:
         "hours_left"}. Targets already counted as completed are excluded."""
         info: dict[int, dict] = {}
         for record in self.active_requests(now):
+            if record["reward"] <= 0:
+                # reward==0 requests are decoys (public field identifies them);
+                # their targets fall back to ordinary coverage scheduling
+                continue
             share = record["reward"] / max(1, record["minimum"])
             hours_left = (record["deadline"] - now).total_seconds() / 3600.0
+            # All-or-nothing reward: when exactly one more completed target finishes
+            # the request, that target's true marginal is the whole remaining reward
+            done = len(record["completed"])
+            if done >= record["minimum"] - 1:
+                share = record["reward"]
             for tid in record["targets"]:
                 if tid in record["completed"]:
                     continue
