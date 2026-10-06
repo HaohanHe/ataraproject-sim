@@ -23,6 +23,7 @@ ALT_MARGIN_DEG = 0.6
 SKY_MEMORY_HOURS = 2.0
 RECENT_SAMPLES = 60
 EARLIER_SAMPLES = 60
+RECENT_WINDOW_HOURS = 200.0
 SIDEREAL_DEG_PER_SECOND = 360.98564736629 / 86400.0
 
 
@@ -104,7 +105,8 @@ class SurveyState:
         n = len(self.ids)
         self.hmax = [max_hour_angle_deg(self.dec[i], self.lat, self.min_alt + ALT_MARGIN_DEG) for i in range(n)]
         self.factor = [0.0] * n
-        self.misses = [0] * n
+        self.best_score = [0.0] * n   # server-style best contribution: weight*factor*prog_mult
+        self.misses = [0.0] * n
         self.attempts = [0] * n
         self.active = [i for i in range(n) if self.hmax[i] > 0.0]
 
@@ -288,6 +290,8 @@ class SurveyState:
             matched = band == self.pending_program
             factor = factor_if_match if matched else factor_if_miss
             self.factor[i] = max(self.factor[i], min(1.0, factor))
+            score_pm = declared_multiplier if matched else mismatch
+            self.best_score[i] = max(self.best_score[i], weight * factor * score_pm)
             if self.required[i] and self.factor[i] < scoring.required_threshold:
                 self.attempts[i] += 1
             if factor < 0.97 and self.flux[i] > 0 and self.pending_duration > 0 and prediction.model > 0:
@@ -319,14 +323,20 @@ class SurveyState:
         history = self.clean_history
         if os.environ.get("FAULT_DEBUG"):
             print(f"fault-debug: clean_history={len(history)}", file=sys.stderr)
-        if len(history) < RECENT_SAMPLES + EARLIER_SAMPLES:
+        if len(history) < 32:
             return None
-        recent = history[-RECENT_SAMPLES:]
-        earlier = history[:-RECENT_SAMPLES]
+        # Time-bounded recent window (not a fixed count): when the scheduler
+        # produces few clean samples per night, a count window spans pre-fault
+        # weeks and dilutes the dip. Use the last ~8 nights.
+        cutoff = history[-1][0] - RECENT_WINDOW_HOURS
+        recent = [h for h in history if h[0] >= cutoff]
+        earlier = [h for h in history if h[0] < cutoff]
+        if len(recent) < 12 or len(earlier) < 20:
+            return None
         span = recent[-1][0] - recent[0][0]
         nights = len({night for _, night, _ in recent})
         if os.environ.get("FAULT_DEBUG"):
-            print(f"fault-debug: recent span={span:.1f}h nights={nights}", file=sys.stderr)
+            print(f"fault-debug: recent span={span:.1f}h nights={nights} n={len(recent)}", file=sys.stderr)
         if span < 4.0 or nights < 2:
             return None
         recent_sorted = sorted(r for _, _, r in recent)

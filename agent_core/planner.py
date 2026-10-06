@@ -408,6 +408,11 @@ class Planner:
             return (state.weight[i] * (1.0 - f * f) + REQUIRED_BONUS * (1.0 if f < 0.5 else 0.35)) * damp
         return 0.0 if f >= DONE_FACTOR else state.weight[i] * (1.0 - f * f) * damp
 
+    def _expected_mult(self, state, model: float) -> float:
+        scoring = state.scoring
+        band = scoring.program_band(model * (state.scale / 0.95))
+        return scoring.program_multipliers.get(band, 1.0)
+
     # -- main planning pass -------------------------------------------------------
 
     def plan(self, now, night_end, night_index: int, hours: float, wall_remaining: float = 1e9):
@@ -463,6 +468,9 @@ class Planner:
         achievable_cache: dict[int, float] = {}
         scoring = state.scoring
 
+        def expected_mult(model: float) -> float:
+            return self._expected_mult(state, model)
+
         def achievable(i: int) -> float:
             cached = achievable_cache.get(i)
             if cached is not None:
@@ -475,7 +483,10 @@ class Planner:
             up = (state.hmax[i] - ha) / SIDEREAL_DEG_PER_SECOND if state.hmax[i] < 180 else 1e9
             reach = min(1.0, k * min(state.max_exposure, up, seconds_left))
             f = state.factor[i]
-            gain = state.weight[i] * max(0.0, reach * reach - f * f)
+            # Score-space marginal vs this target's current best contribution.
+            # Done targets (best_score >= predicted) get zero automatically.
+            predicted = state.weight[i] * reach * expected_mult(model)
+            gain = max(0.0, predicted - state.best_score[i])
             if state.required[i] and f < 0.5 and reach >= 0.5:
                 gain += REQUIRED_BONUS
             ri = req_info.get(i)
@@ -523,14 +534,10 @@ class Planner:
             near = [j for j in state.neighbours(
                 state.ra[anchor], state.dec[anchor], fov_r
             ) if j in visible]
-            # Fibre competition must reflect MARGINAL value: a target already near
-            # done has little science left, so weight its achievable by remaining
-            # factor (1-f^2); otherwise bright done targets steal fibres from
-            # never-observed faint targets on every revisit. A floor (0.25) keeps
-            # bright targets sampled enough to feed the fault detector's clean
-            # history (clean samples need model>=0.35, i.e. bright targets).
-            near_values = {j: achievable(j) * max(0.0, 1.0 - state.factor[j] ** 2)
-                           for j in near}
+            # achievable() already returns score-space marginal (zero for targets
+            # whose best contribution cannot improve), so it feeds fibre competition
+            # directly.
+            near_values = {j: achievable(j) for j in near}
             for fiber in fibers:
                 d_north, d_east = self.grid.fiber_center(fiber)
                 c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
@@ -592,11 +599,13 @@ class Planner:
                 if item["up"] < duration:
                     continue
                 reached = min(1.0, item["k"] * duration)
-                f = state.factor[item["i"]]
-                gain += state.weight[item["i"]] * max(0.0, reached - f)
-                if state.required[item["i"]] and f < 0.5 and reached >= 0.5:
+                ii = item["i"]
+                f = state.factor[ii]
+                predicted = state.weight[ii] * reached * self._expected_mult(state, item["model"])
+                gain += max(0.0, predicted - state.best_score[ii])
+                if state.required[ii] and f < 0.5 and reached >= 0.5:
                     gain += REQUIRED_BONUS
-                ri = req_info.get(item["i"])
+                ri = req_info.get(ii)
                 if ri and reached >= ri["threshold"]:
                     gain += ri["share"]
             rate = gain / duration
@@ -618,11 +627,13 @@ class Planner:
                     if item["up"] < tf:
                         continue
                     reached = min(1.0, item["k"] * tf)
-                    f = state.factor[item["i"]]
-                    gf += state.weight[item["i"]] * max(0.0, reached - f)
-                    if state.required[item["i"]] and f < 0.5 and reached >= 0.5:
+                    ii = item["i"]
+                    f = state.factor[ii]
+                    predicted = state.weight[ii] * reached * self._expected_mult(state, item["model"])
+                    gf += max(0.0, predicted - state.best_score[ii])
+                    if state.required[ii] and f < 0.5 and reached >= 0.5:
                         gf += REQUIRED_BONUS
-                    ri = req_info.get(item["i"])
+                    ri = req_info.get(ii)
                     if ri and reached >= ri["threshold"]:
                         gf += ri["share"]
                 if gf > 0.0 and (best is None or gf / tf > best[0]):
