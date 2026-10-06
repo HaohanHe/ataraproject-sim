@@ -469,20 +469,48 @@ class Planner:
         anchors: list[tuple[float, int]] = []
         fov_r = self.grid.fov_radius
 
+        # Unfinished targets of every currently active request, grouped per record.
+        req_groups: list[tuple[dict, set]] = []
+        for rec in state.active_requests(now):
+            unfinished = {state.index_of[t] for t in rec["targets"]
+                          if t not in rec["completed"] and t in state.index_of}
+            if unfinished:
+                req_groups.append((rec, unfinished))
+        req_targets: set[int] = set()
+        for _rec, grp in req_groups:
+            req_targets |= grp
+
         def pack_count(ai: int) -> int:
             return sum(1 for j in state.neighbours(state.ra[ai], state.dec[ai], fov_r)
                        if j in visible)
+
+        def req_near_count(ai: int, grp: set) -> int:
+            return sum(1 for j in state.neighbours(state.ra[ai], state.dec[ai], fov_r)
+                       if j in grp and j in visible)
 
         for checked, (priority, i) in enumerate(candidates):
             if checked >= ANCHOR_POOL and len(anchors) >= 3 * ANCHORS:
                 break
             weighted = achievable(i) * priority / max(1e-9, self._value(i))
-            # Density gate: a pointing can only score targets physically inside
-            # the FOV, so prefer anchors whose field packs many fibres. Sparse
-            # anchors are down-weighted (not banned) so isolated targets still
-            # get covered late in the survey.
-            pack_frac = min(1.0, pack_count(i) / self.grid.n)
-            weighted *= pack_frac ** 0.6
+            # Request-dedicated pointing: bypass the density gate only when this
+            # field covers >=2 unfinished request targets (a real completion
+            # contribution); urgency ramps as the deadline approaches.
+            rboost = 1.0
+            for rec, grp in req_groups:
+                if i in grp:
+                    rn = req_near_count(i, grp)
+                    if rn >= 2:
+                        hl = (rec["deadline"] - now).total_seconds() / 3600.0
+                        rboost = max(rboost, 2.0 + 0.6 * rn + max(0.0, 24.0 - hl) * 0.4)
+            if rboost > 1.0:
+                weighted *= rboost
+            else:
+                # Density gate: a pointing can only score targets physically inside
+                # the FOV, so prefer anchors whose field packs many fibres. Sparse
+                # anchors are down-weighted (not banned) so isolated targets still
+                # get covered late in the survey.
+                pack_frac = min(1.0, pack_count(i) / self.grid.n)
+                weighted *= pack_frac ** 0.6
             if weighted > 0:
                 anchors.append((weighted, i))
         if not anchors:
@@ -503,7 +531,20 @@ class Planner:
             near = [j for j in state.neighbours(
                 state.ra[anchor], state.dec[anchor], fov_r
             ) if j in visible]
-            near_values = {j: achievable(j) for j in near}
+            near_boost = 1.0
+            near_group = None
+            for rec, grp in req_groups:
+                if anchor in grp:
+                    rn = req_near_count(anchor, grp)
+                    if rn >= 2:
+                        hl = (rec["deadline"] - now).total_seconds() / 3600.0
+                        b = 2.0 + 0.6 * rn + max(0.0, 24.0 - hl) * 0.4
+                        if b > near_boost:
+                            near_boost, near_group = b, grp
+            near_values = {
+                j: achievable(j) * (near_boost if (near_group is not None and j in near_group) else 1.0)
+                for j in near
+            }
             for fiber in fibers:
                 d_north, d_east = self.grid.fiber_center(fiber)
                 c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
@@ -579,9 +620,18 @@ class Planner:
         # Request targets must cross in a SINGLE exposure (stacked short visits
         # do not count). When the deadline is within ~24 h, force the duration
         # needed to cross the hardest request target in this field.
+        chosen_idx = {item["i"] for item in info.values()}
+        dedicated_groups = []
+        for rec in state.active_requests(now):
+            grp = {state.index_of[t] for t in rec["targets"]
+                   if t not in rec["completed"] and t in state.index_of}
+            if len(grp & chosen_idx) >= 2:
+                dedicated_groups.append(grp & chosen_idx)
         forced = [item for item in info.values()
                   if req_info.get(item["i"]) and item["k"] > 0]
         if forced:
+            # A dedicated request pointing forces the crossing duration even at
+            # a lower nominal rate; incidental request targets still use rates.
             t_needs = [req_info[item["i"]]["threshold"] / item["k"] for item in forced]
             tf = int(math.ceil(max(t_needs) / 30.0) * 30)
             tf = max(state.min_exposure, min(state.max_exposure, tf))
@@ -598,7 +648,9 @@ class Planner:
                     ri = req_info.get(item["i"])
                     if ri and reached >= ri["threshold"]:
                         gf += ri["share"]
-                if gf > 0.0 and (best is None or gf / tf > best[0]):
+                if gf > 0.0 and any(item["i"] in g for g in dedicated_groups):
+                    best = (gf / tf, tf)
+                elif gf > 0.0 and (best is None or gf / tf > best[0]):
                     best = (gf / tf, tf)
         if best is None:
             return None
