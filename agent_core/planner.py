@@ -477,6 +477,15 @@ class Planner:
                 state.ra[anchor], state.dec[anchor], max(NEIGHBOUR_RADIUS_DEG, self.grid.fov * 0.83)
             ) if j in visible]
             near_values = {j: achievable(j) for j in near}
+            # Coverage fairness: never-hit targets inside the wide fill radius are
+            # allowed to compete for fibres before the dense near pool claims
+            # them; otherwise dense anchors monopolise fibres night after night.
+            for j in state.neighbours(state.ra[anchor], state.dec[anchor],
+                                     max(WIDE_RADIUS_DEG, self.grid.fov * 0.78)):
+                if j in visible and state.factor[j] < 0.02 and j not in near_values:
+                    vj = achievable(j)
+                    if vj > 0.0:
+                        near_values[j] = vj
             for fiber in fibers:
                 d_north, d_east = self.grid.fiber_center(fiber)
                 c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
