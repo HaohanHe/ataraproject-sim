@@ -469,9 +469,12 @@ class Planner:
         anchors: list[tuple[float, int]] = []
         fov_r = self.grid.fov_radius
 
-        # Unfinished targets of every currently active request, grouped per record.
+        # Unfinished targets of every currently active PAID request, grouped per
+        # record. Reward-0 "requests" are distractors and are never pursued.
         req_groups: list[tuple[dict, set]] = []
         for rec in state.active_requests(now):
+            if rec["reward"] <= 0:
+                continue
             unfinished = {state.index_of[t] for t in rec["targets"]
                           if t not in rec["completed"] and t in state.index_of}
             if unfinished:
@@ -492,25 +495,30 @@ class Planner:
             if checked >= ANCHOR_POOL and len(anchors) >= 3 * ANCHORS:
                 break
             weighted = achievable(i) * priority / max(1e-9, self._value(i))
-            # Request-dedicated pointing: bypass the density gate only when this
-            # field covers >=2 unfinished request targets (a real completion
-            # contribution); urgency ramps as the deadline approaches.
+            # Request-dedicated pointing: pursue any field covering an unfinished
+            # paid-request target; stronger when several cluster together. Late
+            # in the window urgency ramps up.
             rboost = 1.0
             for rec, grp in req_groups:
                 if i in grp:
                     rn = req_near_count(i, grp)
-                    if rn >= 2:
+                    if rn >= 1:
                         hl = (rec["deadline"] - now).total_seconds() / 3600.0
-                        rboost = max(rboost, 2.0 + 0.6 * rn + max(0.0, 24.0 - hl) * 0.4)
+                        urgency = max(0.0, 18.0 - hl) * 0.35
+                        rboost = max(rboost, (1.8 + 0.7 * rn if rn >= 2 else 2.2) + urgency)
             if rboost > 1.0:
                 weighted *= rboost
             else:
                 # Density gate: a pointing can only score targets physically inside
                 # the FOV, so prefer anchors whose field packs many fibres. Sparse
                 # anchors are down-weighted (not banned) so isolated targets still
-                # get covered late in the survey.
+                # get covered late in the survey. Required targets keep a high
+                # floor: they must be completed before faults trap their window.
                 pack_frac = min(1.0, pack_count(i) / self.grid.n)
-                weighted *= pack_frac ** 0.6
+                gate = pack_frac ** 0.6
+                if state.required[i]:
+                    gate = max(gate, 0.75)
+                weighted *= gate
             if weighted > 0:
                 anchors.append((weighted, i))
         if not anchors:
@@ -536,9 +544,10 @@ class Planner:
             for rec, grp in req_groups:
                 if anchor in grp:
                     rn = req_near_count(anchor, grp)
-                    if rn >= 2:
+                    if rn >= 1:
                         hl = (rec["deadline"] - now).total_seconds() / 3600.0
-                        b = 2.0 + 0.6 * rn + max(0.0, 24.0 - hl) * 0.4
+                        urgency = max(0.0, 18.0 - hl) * 0.35
+                        b = (1.8 + 0.7 * rn if rn >= 2 else 2.2) + urgency
                         if b > near_boost:
                             near_boost, near_group = b, grp
             near_values = {
@@ -623,9 +632,11 @@ class Planner:
         chosen_idx = {item["i"] for item in info.values()}
         dedicated_groups = []
         for rec in state.active_requests(now):
+            if rec["reward"] <= 0:
+                continue
             grp = {state.index_of[t] for t in rec["targets"]
                    if t not in rec["completed"] and t in state.index_of}
-            if len(grp & chosen_idx) >= 2:
+            if len(grp & chosen_idx) >= 1:
                 dedicated_groups.append(grp & chosen_idx)
         forced = [item for item in info.values()
                   if req_info.get(item["i"]) and item["k"] > 0]
