@@ -477,12 +477,12 @@ class Planner:
             if checked >= ANCHOR_POOL and len(anchors) >= 3 * ANCHORS:
                 break
             weighted = achievable(i) * priority / max(1e-9, self._value(i))
-            # Density gate: a pointing can only score targets physically inside
-            # the FOV, so prefer anchors whose field packs many fibres. Sparse
-            # anchors are down-weighted (not banned) so isolated targets still
-            # get covered late in the survey.
+            # Density-first early (pack fibres on rich fields), uniform-breadth
+            # late: the gate exponent decays to 0 as the survey progresses so
+            # sparse-region anchors win pointing time before the survey ends.
             pack_frac = min(1.0, pack_count(i) / self.grid.n)
-            weighted *= pack_frac ** 0.6
+            progress = min(1.0, night_index / max(1, len(state.nights)))
+            weighted *= pack_frac ** (0.6 * (1.0 - progress))
             if weighted > 0:
                 anchors.append((weighted, i))
         if not anchors:
