@@ -398,6 +398,9 @@ class SurveyState:
         for record in self.active_requests(now):
             share = record["reward"] / max(1, record["minimum"])
             hours_left = (record["deadline"] - now).total_seconds() / 3600.0
+            # All-or-nothing: the last target needed carries the whole remaining reward
+            if len(record["completed"]) >= record["minimum"] - 1:
+                share = record["reward"]
             for tid in record["targets"]:
                 if tid in record["completed"]:
                     continue
