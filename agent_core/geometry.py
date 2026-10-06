@@ -157,6 +157,12 @@ class FiberGrid:
         self.pitch = float(instrument["pitch_deg"])
         self.fov = float(instrument["fov_side_deg"])
 
+    @property
+    def fov_radius(self) -> float:
+        """True circular field radius used by the engine's dot-product gate:
+        half-diagonal of the square FOV plus the 0.3 deg engine margin."""
+        return math.degrees(math.atan(math.sqrt(2.0) * math.radians(self.fov / 2.0))) + 0.3
+
     def fiber_center(self, fiber: int) -> tuple[float, float]:
         row, col = divmod(fiber, self.side)
         middle = (self.side - 1) / 2.0

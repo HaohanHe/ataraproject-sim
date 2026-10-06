@@ -452,10 +452,22 @@ class Planner:
             return result
 
         anchors: list[tuple[float, int]] = []
+        fov_r = self.grid.fov_radius
+
+        def pack_count(ai: int) -> int:
+            return sum(1 for j in state.neighbours(state.ra[ai], state.dec[ai], fov_r)
+                       if j in visible)
+
         for checked, (priority, i) in enumerate(candidates):
             if checked >= ANCHOR_POOL and len(anchors) >= 3 * ANCHORS:
                 break
             weighted = achievable(i) * priority / max(1e-9, self._value(i))
+            # Density gate: a pointing can only score targets physically inside
+            # the FOV, so prefer anchors whose field packs many fibres. Sparse
+            # anchors are down-weighted (not banned) so isolated targets still
+            # get covered late in the survey.
+            pack_frac = min(1.0, pack_count(i) / self.grid.n)
+            weighted *= pack_frac ** 0.6
             if weighted > 0:
                 anchors.append((weighted, i))
         if not anchors:
@@ -474,7 +486,7 @@ class Planner:
             tried += 1
             a_alt, a_az = altaz(anchor)
             near = [j for j in state.neighbours(
-                state.ra[anchor], state.dec[anchor], max(NEIGHBOUR_RADIUS_DEG, self.grid.fov * 0.83)
+                state.ra[anchor], state.dec[anchor], fov_r
             ) if j in visible]
             near_values = {j: achievable(j) for j in near}
             for fiber in fibers:
@@ -618,7 +630,7 @@ class Planner:
             empty = [f for f in range(self.grid.n) if str(f) not in assignments]
             fill: dict[int, tuple] = {}
             placed: set[str] = set()
-            fill_radius = max(WIDE_RADIUS_DEG, self.grid.fov * 0.78)
+            fill_radius = self.grid.fov_radius
             for j in state.neighbours(c_ra, c_dec, fill_radius):
                 tid = state.ids[j]
                 if tid in taken or tid in placed:
