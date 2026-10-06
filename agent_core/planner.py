@@ -486,6 +486,7 @@ class Planner:
                     vj = achievable(j)
                     if vj > 0.0:
                         near_values[j] = vj
+            injected = set(near_values) - set(near)
             for fiber in fibers:
                 d_north, d_east = self.grid.fiber_center(fiber)
                 c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
@@ -505,6 +506,10 @@ class Planner:
                     if fib is None:
                         continue
                     score = v * (1.0 if margin >= EDGE_MARGIN_DEG * (1 + 1.5 * state.misses[j]) else 0.4)
+                    if j in injected:
+                        n_inj = sum(1 for w in chosen.values() if w[1] in injected)
+                        if n_inj >= 2:
+                            continue
                     existing = chosen.get(fib)
                     if existing is None or score > existing[0]:
                         chosen[fib] = (score, j, margin)
