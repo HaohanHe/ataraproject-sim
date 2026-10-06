@@ -99,6 +99,7 @@ class Planner:
         self.last_report_hours = float("-inf")
         self.dip_misses = 0
         self.suspicion_hours: list[tuple[float, int]] = []
+        self.fast_suspicion: list[tuple[float, float]] = []
         self.night_index_seen: int | None = None
         self.consecutive_reports = 0
         self._last_forecast_notices: list = []
@@ -276,6 +277,7 @@ class Planner:
             self.dip_misses += 1
             if self.dip_misses >= 12:
                 self.suspicion_hours = []
+                self.fast_suspicion = []
                 self.dip_misses = 0
             return None
         self.dip_misses = 0
@@ -291,34 +293,52 @@ class Planner:
         #    a false report (a real fault persists every remaining night).
         dark_ok = evidence.dark_checks >= 6 and \
             evidence.dark_matched >= 0.6 * evidence.dark_checks
-        fast_track = dark_ok and evidence.drop < 0.55
+        # Fast track is tracked separately from the standard (zero-DARK) track so a
+        # single early standard confirmation cannot block it. During a real fault the
+        # healthy-DARK checks age out within a night (fault exposures score at neither
+        # declared nor mismatch rate); the first fast confirmation stays valid.
+        fast_eligible = dark_ok and evidence.drop < 0.55
+        fast_ready = False
+        if fast_eligible:
+            if not self.fast_suspicion:
+                self.fast_suspicion.append((hours, evidence.recent_median))
+            elif hours - self.fast_suspicion[0][0] >= 2.0:
+                fast_ready = True
+        fast_track = fast_ready
         standard_track = not fast_track
+        if os.environ.get("FAULT_DEBUG"):
+            self.log(f"fault-debug: dip drop={evidence.drop} susp={len(self.suspicion_hours)} "
+                     f"dark_ok={dark_ok} fast_eligible={fast_eligible} fast_ready={fast_ready} "
+                     f"fast0={self.fast_suspicion[0][0] if self.fast_suspicion else None} darkc={evidence.dark_checks}")
         if fast_track:
-            if self.suspicion_hours and hours - self.suspicion_hours[-1][0] < 3.0:
-                return None
-            self.suspicion_hours.append((hours, night_index, evidence.recent_median))
-            if len(self.suspicion_hours) < 2:
-                return None
+            pass
         else:
-            nights_confirmed = {n for _, n, _m in self.suspicion_hours}
+            nights_confirmed = {n for _, n, _m, *_ in self.suspicion_hours}
             if night_index not in nights_confirmed:
-                self.suspicion_hours.append((hours, night_index, evidence.recent_median))
+                self.suspicion_hours.append((hours, night_index, evidence.recent_median, False))
                 nights_confirmed.add(night_index)
             if len(nights_confirmed) < 3:
                 return None
         # Earthquake gate: a quake depresses efficiency but recovers night by night,
         # while a real instrument fault stays flat. When confirmations span nights and
         # the latest median has recovered materially over the first, this is a quake.
-        nights_span = len({n for _, n, _m in self.suspicion_hours})
-        first_med = self.suspicion_hours[0][2]
-        latest_med = self.suspicion_hours[-1][2]
+        if fast_track:
+            first_med = self.fast_suspicion[0][1]
+            latest_med = evidence.recent_median
+            nights_span = 1
+        else:
+            nights_span = len({n for _, n, _m, *_ in self.suspicion_hours})
+            first_med = self.suspicion_hours[0][2]
+            latest_med = self.suspicion_hours[-1][2]
         if nights_span >= 2 and first_med > 0 and latest_med >= 1.3 * first_med:
             self.log(f"planner: dip at {payload.get('now_utc')} shows earthquake-style recovery "
                      f"({first_med:.3f} -> {latest_med:.3f}); not a fault, track reset")
             self.suspicion_hours = []
+            self.fast_suspicion = []
             self.last_report_hours = hours
             return None
         self.suspicion_hours = []
+        self.fast_suspicion = []
         verdict = self._ask_verdict(evidence, payload)
         # Both completed tracks are hard evidence: the fast track needs a strong dip
         # confirmed by many DARK checks; the standard track needs the dip to persist on
@@ -503,7 +523,14 @@ class Planner:
             near = [j for j in state.neighbours(
                 state.ra[anchor], state.dec[anchor], fov_r
             ) if j in visible]
-            near_values = {j: achievable(j) for j in near}
+            # Fibre competition must reflect MARGINAL value: a target already near
+            # done has little science left, so weight its achievable by remaining
+            # factor (1-f^2); otherwise bright done targets steal fibres from
+            # never-observed faint targets on every revisit. A floor (0.25) keeps
+            # bright targets sampled enough to feed the fault detector's clean
+            # history (clean samples need model>=0.35, i.e. bright targets).
+            near_values = {j: achievable(j) * max(0.0, 1.0 - state.factor[j] ** 2)
+                           for j in near}
             for fiber in fibers:
                 d_north, d_east = self.grid.fiber_center(fiber)
                 c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
