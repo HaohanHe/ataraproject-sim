@@ -404,9 +404,7 @@ class Planner:
         threshold = state.scoring.required_threshold
         if state.required[i]:
             if f >= threshold:
-                # required target is safe once past the single-exposure cliff;
-                # close it and redirect the fibre to never-covered targets
-                return 0.0
+                return state.weight[i] * max(0.0, 1.0 - f * f) * damp
             return (state.weight[i] * (1.0 - f * f) + REQUIRED_BONUS * (1.0 if f < 0.5 else 0.35)) * damp
         return 0.0 if f >= DONE_FACTOR else state.weight[i] * (1.0 - f * f) * damp
 
