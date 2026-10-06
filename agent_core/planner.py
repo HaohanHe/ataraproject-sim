@@ -23,6 +23,7 @@ example target-for-target, so both examples solve the problem the same way.
 from __future__ import annotations
 
 import math
+import os
 from datetime import timedelta
 
 from .geometry import (
@@ -96,6 +97,7 @@ class Planner:
         self.observe_count = 0
         self.reports = 0
         self.last_report_hours = float("-inf")
+        self.dip_misses = 0
         self.suspicion_hours: list[tuple[float, int]] = []
         self.night_index_seen: int | None = None
         self.consecutive_reports = 0
@@ -260,10 +262,23 @@ class Planner:
         if self.reports >= MAX_REPORTS or hours - self.last_report_hours < 24.0:
             return None
         evidence = state.fault_evidence()
+        if os.environ.get("FAULT_DEBUG") and evidence is not None:
+            self.log(f"fault-debug: drop={evidence.drop} recent={evidence.recent_median} "
+                     f"earlier={evidence.earlier_median} rn={evidence.recent_nights} "
+                     f"rs={evidence.recent_samples} dark={evidence.dark_checks}")
         threshold = REPORT_DROP if self.reports == 0 else REPORT_DROP - 0.07
-        if evidence is None or evidence.drop >= threshold:
-            self.suspicion_hours = []
+        if evidence is None:
             return None
+        if evidence.drop >= threshold:
+            # A noisy (coverage-mix dependent) median can exceed the threshold for a
+            # slot or two while a real fault persists. Require a sustained recovery
+            # (many consecutive slots with no dip) before discarding confirmations.
+            self.dip_misses += 1
+            if self.dip_misses >= 12:
+                self.suspicion_hours = []
+                self.dip_misses = 0
+            return None
+        self.dip_misses = 0
         if evidence.dark_checks < 6:
             state.force_program = "DARK"
         elif evidence.dark_matched < 0.6 * evidence.dark_checks:
@@ -297,7 +312,7 @@ class Planner:
         nights_span = len({n for _, n, _m in self.suspicion_hours})
         first_med = self.suspicion_hours[0][2]
         latest_med = self.suspicion_hours[-1][2]
-        if nights_span >= 2 and first_med > 0 and latest_med >= 1.12 * first_med:
+        if nights_span >= 2 and first_med > 0 and latest_med >= 1.3 * first_med:
             self.log(f"planner: dip at {payload.get('now_utc')} shows earthquake-style recovery "
                      f"({first_med:.3f} -> {latest_med:.3f}); not a fault, track reset")
             self.suspicion_hours = []

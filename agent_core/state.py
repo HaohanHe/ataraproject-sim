@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import bisect
 import math
+import os
+import sys
 from collections import deque
 from typing import NamedTuple, Optional
 
@@ -315,12 +317,16 @@ class SurveyState:
 
     def fault_evidence(self) -> Optional[FaultEvidence]:
         history = self.clean_history
+        if os.environ.get("FAULT_DEBUG"):
+            print(f"fault-debug: clean_history={len(history)}", file=sys.stderr)
         if len(history) < RECENT_SAMPLES + EARLIER_SAMPLES:
             return None
         recent = history[-RECENT_SAMPLES:]
         earlier = history[:-RECENT_SAMPLES]
         span = recent[-1][0] - recent[0][0]
         nights = len({night for _, night, _ in recent})
+        if os.environ.get("FAULT_DEBUG"):
+            print(f"fault-debug: recent span={span:.1f}h nights={nights}", file=sys.stderr)
         if span < 4.0 or nights < 2:
             return None
         recent_sorted = sorted(r for _, _, r in recent)
