@@ -63,7 +63,7 @@ BLOCKING_KINDS = {"terrain_obstruction", "rocket_launch"}
 DIRECTION_AZ = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0,
                 "SW": 225.0, "W": 270.0, "NW": 315.0}
 
-REPORT_DROP = 0.75
+REPORT_DROP = 0.62
 REPORT_CONFIRMATIONS = 3
 REPORT_SPACING_HOURS = 6.0
 MAX_REPORTS = 2
