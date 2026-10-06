@@ -396,6 +396,8 @@ class SurveyState:
         "hours_left"}. Targets already counted as completed are excluded."""
         info: dict[int, dict] = {}
         for record in self.active_requests(now):
+            if record["reward"] <= 0:
+                continue
             share = record["reward"] / max(1, record["minimum"])
             hours_left = (record["deadline"] - now).total_seconds() / 3600.0
             for tid in record["targets"]:
