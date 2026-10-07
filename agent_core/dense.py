@@ -53,7 +53,7 @@ assert len(_REFINE_OFFSETS) == REFINE_NEIGHBOURS
 
 def dense_enabled() -> bool:
     """Whether dense candidates / refinement are switched on (env OBS_ENABLE_DENSE)."""
-    return os.environ.get("OBS_ENABLE_DENSE", "0") != "0"
+    return os.environ.get("OBS_ENABLE_DENSE", "1") != "0"
 
 
 def _spherical_centroid(indices: Sequence[int], ra: Sequence[float],

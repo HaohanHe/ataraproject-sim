@@ -39,8 +39,11 @@ from .geometry import (
     tangent_offsets,
     wrap180,
 )
+from .dense import DensePlanner
 from .llm_client import LLMClient
 from .memory import TraceLog
+from .offset import OffsetLearner
+from .lambda_pricing import TimePricing
 from .state import PendingPrediction
 
 REQUIRED_BONUS = 60.0
@@ -93,6 +96,11 @@ class Planner:
         self.llm = LLMClient(log=log)
         self.trace = TraceLog(log=log)
 
+        self.offset = OffsetLearner(state.fiber_grid, log=self.log)
+        self.dense = DensePlanner(self.grid, log=self.log)
+        self.tp = TimePricing(state.nights, state.survey_start, state.survey_end)
+        self._sent: object | None = None  # pending observe evidence for offset learning
+
         self.observe_count = 0
         self.reports = 0
         self.last_report_hours = float("-inf")
@@ -123,6 +131,14 @@ class Planner:
         if last_result and last_result.get("action") == "observe":
             self.total_assigned += int(last_result.get("assigned_count", 0))
             self.total_hit += int(last_result.get("hit_count", 0))
+            realized = sum(float(h.get("score", 0)) for h in last_result.get("hits", []))
+            duration = self._sent[4] if self._sent else state.pending_duration
+            self.tp.update(realized, duration)
+            if self._sent is not None:
+                sent_alt, sent_az, assignments_int, target_altaz, _dur = self._sent
+                hit_ids = [h.get("target_id") for h in last_result.get("hits", [])]
+                self.offset.record_observe(sent_alt, sent_az, assignments_int, target_altaz, hit_ids)
+                self._sent = None
         self._pace(payload, now)
 
         night = state.current_night(now)
@@ -464,7 +480,37 @@ class Planner:
 
         n_anchors = 1 if state.fast_level >= 1 else ANCHORS
         fibers = range(self.grid.n) if state.fast_level < 2 else self.central_fibers
-        best = None  # (total, c_alt, c_az, chosen)
+
+        def pack_around(c_alt: float, c_az: float, nbra: float, nbdec: float):
+            """Pack the near pool around a concrete field centre (c_alt, c_az).
+            Shared verbatim by the anchor search and the dense-patch candidates so the
+            two cannot drift; nbra/nbdec is the RA/Dec the neighbour pool is built on.
+            Returns (total, c_alt, c_az, chosen, nbra, nbdec) or None."""
+            near = [j for j in state.neighbours(
+                nbra, nbdec, max(NEIGHBOUR_RADIUS_DEG, self.grid.fov * 0.83)
+            ) if j in visible]
+            near_values = {j: achievable(j) for j in near}
+            chosen: dict[int, tuple[float, int, float]] = {}  # fiber -> (score, j, margin)
+            for j, v in near_values.items():
+                if v <= 0.0:
+                    continue
+                alt, az = altaz(j)
+                offsets = tangent_offsets(alt, az, c_alt, c_az)
+                if offsets is None:
+                    continue
+                fib, margin = self.grid.classify(*offsets)
+                if fib is None:
+                    continue
+                score = v * (1.0 if margin >= EDGE_MARGIN_DEG * (1 + 1.5 * state.misses[j]) else 0.4)
+                existing = chosen.get(fib)
+                if existing is None or score > existing[0]:
+                    chosen[fib] = (score, j, margin)
+            if not chosen:
+                return None
+            total = sum(s for s, _, _ in chosen.values())
+            return (total, c_alt, c_az, chosen, nbra, nbdec)
+
+        best = None  # (total, c_alt, c_az, chosen, nbra, nbdec)
         tried = 0
         for _, anchor in anchors:
             if tried >= n_anchors and best is not None:
@@ -473,10 +519,6 @@ class Planner:
                 break
             tried += 1
             a_alt, a_az = altaz(anchor)
-            near = [j for j in state.neighbours(
-                state.ra[anchor], state.dec[anchor], max(NEIGHBOUR_RADIUS_DEG, self.grid.fov * 0.83)
-            ) if j in visible]
-            near_values = {j: achievable(j) for j in near}
             for fiber in fibers:
                 d_north, d_east = self.grid.fiber_center(fiber)
                 c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
@@ -484,29 +526,35 @@ class Planner:
                     continue
                 c_alt = round(c_alt, 4)
                 c_az = round(c_az, 4) % 360.0
-                chosen: dict[int, tuple[float, int, float]] = {}  # fiber -> (score, j, margin)
-                for j, v in near_values.items():
-                    if v <= 0.0:
-                        continue
-                    alt, az = altaz(j)
-                    offsets = tangent_offsets(alt, az, c_alt, c_az)
-                    if offsets is None:
-                        continue
-                    fib, margin = self.grid.classify(*offsets)
-                    if fib is None:
-                        continue
-                    score = v * (1.0 if margin >= EDGE_MARGIN_DEG * (1 + 1.5 * state.misses[j]) else 0.4)
-                    existing = chosen.get(fib)
-                    if existing is None or score > existing[0]:
-                        chosen[fib] = (score, j, margin)
-                if not chosen:
-                    continue
-                total = sum(score for score, _, _ in chosen.values())
-                if best is None or total > best[0]:
-                    best = (total, c_alt, c_az, chosen)
+                cand = pack_around(c_alt, c_az, state.ra[anchor], state.dec[anchor])
+                if cand is not None and (best is None or cand[0] > best[0]):
+                    best = cand
+
+        # Dense-patch candidates: aggregate the unfinished targets on the sky into bins
+        # and pack the densest centroids (aligned to the central fibres) through the very
+        # same pack_around block as an anchor.  No-op when OBS_ENABLE_DENSE=0.
+        dense_centers = self.dense.bin_centers([i for _, i in candidates], state.ra, state.dec)
+        for ra_c, dec_c, c_alt, c_az, _fiber in self.dense.candidate_pointings(
+                dense_centers, lst, state.lat, state.min_alt):
+            cand = pack_around(c_alt, c_az, ra_c, dec_c)
+            if cand is not None and (best is None or cand[0] > best[0]):
+                best = cand
+
         if best is None:
             return None
-        _, c_alt, c_az, chosen = best
+        _best_total, c_alt, c_az, chosen, nbra, nbdec = best
+
+        # Hill-climb the chosen centre on the tangent plane (0.1 deg, 8 neighbours,
+        # exposure duration held fixed).  Re-pack at the moved centre so the handed-down
+        # chosen matches what we actually point at.  Identity when dense is off.
+        def pack_total(alt: float, az: float) -> float:
+            cand = pack_around(alt, az, nbra, nbdec)
+            return cand[0] if cand is not None else float("-inf")
+
+        r_alt, r_az, _ = self.dense.refine(c_alt, c_az, pack_total, alt_lo=state.min_alt + 1.5)
+        refined = pack_around(r_alt, r_az, nbra, nbdec)
+        if refined is not None:
+            c_alt, c_az, chosen = r_alt, r_az, refined[3]
         return self._finish_plan(now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index, req_info, wall_remaining)
 
     def _finish_plan(self, now, lst, c_alt, c_az, chosen, seconds_left, moon, altaz, hours, night_index, req_info, wall_remaining: float = 1e9):
@@ -527,7 +575,15 @@ class Planner:
             info[fiber] = {"i": j, "alt": alt, "az": az, "model": model, "up": up, "k": k}
         center_up = (c_hmax - c_ha) / SIDEREAL_DEG_PER_SECOND if c_hmax < 180 else 1e9
 
-        best = None  # (rate, duration)
+        # Two duration optima are tracked side by side on the SAME gain curve:
+        #   best_rate : the legacy gain-per-second rule (always the baseline).
+        #   best_net  : gain - lambda*T, the time-priced optimum (only when on).
+        # The final exposure is min(best_rate, best_net): the time price may only ever
+        # SHORTEN the exposure relative to the baseline, never lengthen it.  When lambda
+        # is off (or lambda==0 early in the season) best_net sits on the longest
+        # duration, so min() collapses straight back to best_rate -- the old behaviour.
+        best_rate = None  # (rate, duration)
+        best_net = None   # (net, duration)
         for base in DURATIONS:
             duration = round((base * state.duration_scale) / 30.0) * 30
             duration = int(max(state.min_exposure, min(state.max_exposure, duration)))
@@ -546,12 +602,37 @@ class Planner:
                 if ri and reached >= ri["threshold"]:
                     gain += ri["share"]
             rate = gain / duration
-            if best is None or rate > best[0]:
-                best = (rate, duration)
+            if best_rate is None or rate > best_rate[0]:
+                best_rate = (rate, duration)
+            if self.tp.enabled:
+                net = self.tp.net_gain(gain, duration, now)
+                # Tie on net MUST prefer the LONGEST duration: when lambda==0 the gain
+                # curve plateaus after saturation and net is flat, so walking the
+                # increasing-T list with '>=' leaves best_net at the longest feasible
+                # exposure -- then min(best_rate, best_net) collapses straight back to
+                # the baseline.  Once lambda>0 the plateau slopes down (lambda*T grows
+                # for no extra gain), so longer durations strictly lose and best_net
+                # naturally stops at the efficient short point.
+                if best_net is None or net >= best_net[0]:
+                    best_net = (net, duration)
+
+        if best_rate is None:
+            return None
+        duration = best_rate[1]
+        if self.tp.enabled and best_net is not None and best_net[0] > 0.0:
+            # The time price may only SHORTEN the baseline, and only when the net-optimal
+            # exposure is itself profitable (net > 0).  On late-season low-yield fields
+            # every duration has negative net; picking the shortest loss there would emit
+            # a useless ~300s exposure instead of the baseline long one, so we leave the
+            # baseline duration untouched when net is not positive.
+            duration = min(duration, best_net[1])
 
         # Request targets must cross in a SINGLE exposure (stacked short visits
         # do not count). When the deadline is within ~24 h, force the duration
-        # needed to cross the hardest request target in this field.
+        # needed to cross the hardest request target in this field.  This is a
+        # correctness constraint judged on the BASELINE rate (tf is usually longer
+        # than the rate optimum); once forced wins it overrides duration and is
+        # exempt from the lambda shortening above.
         forced = [item for item in info.values()
                   if req_info.get(item["i"]) and item["k"] > 0]
         if forced:
@@ -571,12 +652,10 @@ class Planner:
                     ri = req_info.get(item["i"])
                     if ri and reached >= ri["threshold"]:
                         gf += ri["share"]
-                if gf > 0.0 and (best is None or gf / tf > best[0]):
-                    best = (gf / tf, tf)
-        if best is None:
-            return None
-        duration = best[1]
-        if best[0] <= 0.0:
+                if gf > 0.0 and gf / tf > best_rate[0]:
+                    duration = tf
+
+        if best_rate[0] <= 0.0:
             if state.has_recent_sample(hours):
                 return None
             fallback = next((d for d in (900, 600, 300) if d <= seconds_left and d <= center_up), None)
@@ -591,7 +670,8 @@ class Planner:
         if not assignments:
             return None
 
-        band_scale = state.scale / 0.95
+        band_fit = state.bandfit.band_scale(hours)
+        band_scale = band_fit if band_fit is not None else state.scale / 0.95
         votes = {"DARK": 0.0, "BRIGHT": 0.0, "BACKUP": 0.0}
         for fiber, item in info.items():
             if str(fiber) not in assignments:
@@ -656,9 +736,20 @@ class Planner:
         state.pending_duration = duration
         state.pending_night = night_index
 
+        # Reverse-compensate the commanded pointing for the learned hard-card bias; the
+        # assignments stay relative to the EXPECTED centre.  compensate() is the identity
+        # until offset converges (or OBS_ENABLE_OFFSET=0), so this is a no-op then.
+        sent_alt, sent_az = self.offset.compensate(c_alt, c_az)
+        self._sent = (
+            sent_alt, sent_az,
+            {int(f): t for f, t in assignments.items()},
+            {state.ids[item["i"]]: (item["alt"], item["az"])
+             for fiber, item in info.items() if str(fiber) in assignments},
+            duration,
+        )
         return {
             "action": "observe",
-            "pointing": {"alt_deg": c_alt, "az_deg": c_az},
+            "pointing": {"alt_deg": sent_alt, "az_deg": sent_az},
             "assignments": assignments,
             "duration_seconds": duration,
             "program": program,

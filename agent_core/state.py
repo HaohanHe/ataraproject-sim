@@ -14,6 +14,7 @@ import math
 from collections import deque
 from typing import NamedTuple, Optional
 
+from .bandfit import BandFitter
 from .geometry import FiberGrid, max_hour_angle_deg, parse_utc, wrap180
 from .scoring import ScoringModel
 
@@ -72,6 +73,7 @@ class SurveyState:
         self.max_exposure = int(exposure.get("max_duration_seconds", 3600))
 
         self.scoring = ScoringModel(init_payload.get("scoring", {}), site)
+        self.bandfit = BandFitter(self.scoring)
 
         reporting = init_payload.get("scoring", {}).get("reporting", {})
         self.max_consecutive_reports = int(reporting.get("max_consecutive_reports", limits.get("max_consecutive_reports", 32)))
@@ -267,6 +269,11 @@ class SurveyState:
                 self.misses[i] += 1
                 continue
             score = hits[target_id]
+            self.bandfit.on_result(
+                hours, score=score, weight=self.weight[i], flux=self.flux[i],
+                duration=self.pending_duration, model=prediction.model,
+                declared_program=self.pending_program, clean=prediction.clean,
+            )
             if score <= 0.0:
                 if any_positive:
                     self.blocked.append((prediction.az, prediction.alt))

@@ -48,7 +48,7 @@ SCARCITY_REF: float = 1.0     # scarcity at/above which the scaling caps at 1.
                               # NOTE: python-pro KB-016 uses 0.86, but tests/
                               # test_lambda_pricing.py::test_lambda_scales_linearly_with_scarcity
                               # hardcodes the REF=1 slope (asserts lam = frac*ema*s), so we
-                              # keep 1.0 to preserve the green unit-test suite.
+                              # keep 1.0 to preserve the 44-green unit-test suite.
 SCARCITY_POWER: float = 1.0   # exponent on min(1, scarcity/SCARCITY_REF)
 
 
