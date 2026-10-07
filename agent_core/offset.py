@@ -72,7 +72,7 @@ class OffsetLearner:
         self.fov = float(grid.fov)
         self.glass = float(grid.glass)
 
-        self.enabled = os.environ.get("OBS_ENABLE_OFFSET", "0") != "0"
+        self.enabled = os.environ.get("OBS_ENABLE_OFFSET", "1") != "0"
 
         self._records: Deque[Record] = deque(maxlen=_MAX_RECORDS)
         self._misses = 0          # assigned-but-missed targets seen
@@ -288,7 +288,7 @@ class OffsetLearner:
                     pred = self._predict_hit(x, y, fiber, foa, foe)
                     if pred == hit:
                         correct += 1
-                if best_f_score:
+                if correct > best_f_score:
                     best_f_score = correct
                     best_f = (foa, foe)
         if best_f is not None:
